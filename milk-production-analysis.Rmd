@@ -1,0 +1,473 @@
+---
+title: "Milk Production Data"
+output: html_document
+---
+  
+This document provides an exploratory analysis of a time series of monthly observations of milk production. The dataset can be found at https://raw.githubusercontent.com/ricardoscr/UW-Data-Science-Certificate/master/02-Methods/CADairyProduction.csv.
+The time series contains 228 observations, starting in January, 1995 and ending in December, 2003.
+The values are presented in pounds per cow.
+
+## Setting up:
+
+```{r}
+library(astsa)
+library(forecast)
+library(ggplot2)
+library(MASS)
+library(tseries)
+library(xts)
+library(zoo)
+```
+
+## Importing the data
+
+```{r}
+production.df <- read.csv('./milk_production_data.csv')
+```
+
+Extracting the milk production column and convert it to a time series of frequency 12 (monthly).
+
+```{r}
+milk.ts <- ts(production.df$Milk.Prod, start=1995, freq=12)
+head(milk.ts)
+summary(milk.ts)
+autoplot(milk.ts, main='Milk Production Time Series (pounds per cow)', ylab='Milk Production (pounds per cow)')
+```
+
+By analysing the plot, we can see that the series presents an upward trend and cycles that seem to be season effects. Also, there is heteroscedasticity: the variance seems to be increasing over time.
+
+```{r}
+acf2(milk.ts, main=paste("ACF & PACF for Series: Milk Production (pounds per cow)"))
+
+acf(milk.ts, plot = FALSE)
+pacf(milk.ts, plot = FALSE)
+
+```
+
+The autocorrelation and partial autocorrelation functions also indicates the presence of cycles since correlation does not decay at a constant rate when the lag increases. It even increases from lag 0.5 to 0.6, 0.9 to lag 1 and on each 0.5 increase in lag. So there is a strong correlation between the values one year apart, meaning this cycles are actually seasonality.
+
+```{r}
+ggmonthplot(milk.ts, main="dwef")
+ggseasonplot(milk.ts)
+ggseasonplot(milk.ts, polar=TRUE)
+ggsubseriesplot(milk.ts)
+
+
+autoplot(milk.ts, main='Milk Production Time Series (pounds per cow)') +
+  geom_smooth() +
+  labs("Milk production (in pounds per cow)",
+       y = "Milk production (in pounds per cow)",
+       x = NULL)
+
+gglagplot(milk.ts)
+
+```
+
+We have seen by the ACF and PACF that this is not white noise, but a series of correlated values. Nevertheless, we can do a Box-Ljung test on the time series to formally validate this claim.
+
+```{r}
+Box.test(milk.ts, lag = 4, fitdf = 0, type = "Lj")
+```
+
+"The small p-value is significant at p < 0.001 so this supports our ACF plot consideration above where we stated it is likely this is not purely white noise and that some time series information exists in this data."
+
+# 1. Removing heteroscedasticity
+
+Non-constant variance - heteroscedasticity - can cause problems in linear regression.
+We will need to correct it before modeling to remove the increase in variance in our series. We will apply the log function to the time series. If the series is multiplicative ($Yt=Season_t*Trend_t*E_t$), this will also converte it to an additive time series ($Yt=Season_t+Trend_t+E_t$).
+
+```{r}
+milkLog <- log(milk.ts)
+autoplot(milkLog, main='Log Milk Production Time Series', ylab='Log of Milk Production')
+acf2(milkLog, main='ACF & PACF for Logged Series: Milk Production')
+```
+
+Log serves our purpose since it did remove the increase in variance, but we could also use the more general Box-Cox transformation (of which log is a special case).
+
+```{r}
+print(lambda <- BoxCox.lambda(milk.ts))  # find the optimal value for parameter lambda
+plot.ts(BoxCox(milk.ts, lambda = lambda))
+```
+
+Comparison of log and BoxCox with optimal lambda:
+
+```{r}
+autoplot(milkLog, main='Milk Production Time Series transformed using log', ylab='Log of Milk Production')
+autoplot(BoxCox(milk.ts, lambda = lambda), main='Milk Production Time Series transformed using Box-Cox with lambda = -0.2210074', ylab='Box-Cox with lambda = -0.2210074')
+
+acf2(milkLog, main='ACF & PACF for Logged Milk Production Series')
+acf2(BoxCox(milk.ts, lambda = lambda), main='ACF & PACF for Milk Production Series transformed using Box-Cox')
+```
+
+# 2. Estimate the trend
+
+## 2.1 Using a linear model
+
+```{r}
+summary(fit <- lm(milkLog~time(milkLog)))
+tsplot(milkLog, ylab="Milk Production", col=4, lwd=2)
+abline(fit)           # add the fitted regression line to the plot
+tsplot(resid(fit), main="detrended")
+acf(resid(fit))
+```
+
+Besides showing that correlation decays with time, the ACF of the detrended series looks cyclic. We can see that lag 12 shows great correlation, lag 6 and 18 shows the minimum correlation of the first and second years, respectively.
+This means there must be seasonality, as said before.
+
+Note that fitting a linear model to remove the trend did not make the mean constant.
+
+Also, the ACF shows that the linear model did not get us the result we wanted, since we still have high correlation in sequencial observations. 
+
+The trend was not linear. We will need to fit a polinomial model.
+
+A level 2 polinomial is enough for us to get a detrended series.
+
+```{r}
+summary(fit <- lm(milkLog ~ poly(time(milkLog), 2, raw=TRUE)))
+tsplot(milkLog, ylab="Milk Production", col=4, lwd=2)
+tsplot(resid(fit), main="detrended")
+acf(resid(fit))
+```
+
+Now the only effect visible on the ACF is the season effect. We will deal with this in section 3.
+
+## 2.2 Using the difference operator
+
+```{r}
+var(milkLog)
+
+tsplot(milkLog ,main="Milk Production")
+tsplot(diff(milkLog), main="first difference")
+
+var(diff(milkLog))
+```
+
+The first difference did decrease the variance and it removed the trend.
+
+Comparing the ACF's:
+
+```{r}
+acf(milkLog)
+acf(resid(fit))
+acf(diff(milkLog))
+```
+
+The season component of the series is clear on the ACF's.
+
+# 3. Remove season effects
+
+## 3.1 Using a linear model:
+
+Structural decomposition of milkLog.stl = trend + season + error using lowess
+
+```{r}
+milkLog.stl <- stl(milkLog, "periodic")
+plot(milkLog.stl)  # original series
+```
+
+De-seasonalize the TS:
+```{r}
+milkLog.sa <- seasadj(milkLog.stl)
+plot(milkLog)  # original series
+plot(milkLog.sa)  # seasonal adjusted
+acf(milkLog.sa)
+seasonplot(milkLog.sa, 12, col=rainbow(12), year.labels=TRUE, main="Seasonal plot: Milk production") # seasonal frequency set as 12 for monthly data.
+```
+
+De-seasonalize and de-trend:
+
+```{r}
+milkLog.sa <- seasadj(milkLog.stl)
+
+summary(fit <- lm(milkLog.sa ~ poly(time(milkLog.sa), 2, raw=TRUE)))
+
+tsplot(milkLog.sa, ylab="Milk Production", col=4, lwd=2)
+
+tsplot(resid(fit), main="Residuals")
+acf(resid(fit))
+```
+
+We now isolate the remainder data and then show the ACF and PACF plots.
+
+```{r}
+remainder.ts <- milkLog.stl$time.series[,'remainder']
+acf(remainder.ts)
+pacf(remainder.ts)
+```
+
+We can see from the ACF of Remainder that the time series lags are correlated with time, probably insinuating an Auto Regressive process.
+
+We tried modeling the remainder using ARIMA process with p=1 and q=0.
+
+```{r}
+milk.arima = arima(remainder.ts, order = c(1,0,0), include.mean=F)
+milk.arima
+acf(milk.arima$resid[-1])
+pacf(milk.arima$resid[-1])
+```
+
+We can see that the ARIMA process with p=1 and q=0 is a good choice to model the remainder. 
+Also, from the ACF and PACF plots of the residuals, we see no information left to correlate in any ARIMA process.
+
+## 3.2 Using the difference operator:
+
+```{r}
+var(milkLog)
+var(diff(milkLog))
+
+nsdiffs(milkLog)
+ndiffs(milkLog)
+
+plot(diff(milkLog,12))
+acf(diff(milkLog,12))
+var(diff(milkLog,12))
+
+plot(diff(diff(milkLog,12)))
+acf(diff(diff(milkLog,12)))
+var(diff(diff(milkLog,12)))
+```
+
+The minimum variance is when we do both the first and 12th difference, detrending and removing seasonality. So we should do both.
+
+
+# Analyse the residuals
+
+```{r}
+residuals <- milk.arima$resid[-1]
+plot(residuals)
+plot.ts(residuals)
+acf(residuals)
+```
+
+
+The correlation is gone and we now have a stationary process.
+We can see that the residuals are distributed around the y=0 line, but there are a few outliers.
+
+
+
+# ################# VER SE E COM A SERIE ORIGINAL milk.ts OU C OS RESIDUOS!
+
+
+```{r}
+str(milk.ts)
+milk.ts=as.xts(milk.ts)
+str(milk.ts)
+index(milk.ts)
+```
+
+```{r}
+test.set <- last(milk.ts,'12 month')
+train.set <- window(milk.ts,start=index(first(milk.ts)),end= index(first(test.set))-1)
+plot(train.set)
+```
+
+
+```{r}
+plot(test.set)
+```
+
+
+
+```{r}
+acf2(train.set)
+```
+
+
+
+The sacf and spacf indicate an AR(2)
+
+```{r}
+milk.ar2 <- sarima(train.set, 2,0,0)
+```
+
+```{r}
+milk.ar2
+```
+
+```{r}
+pred <- sarima.for(train.set, 12, 2,0,0)
+```
+
+
+```{r}
+str(pred)
+```
+
+
+```{r}
+accuracy(pred$pred, test.set)
+```
+
+
+```{r}
+high <- pred$pred + 1.96*pred$se
+low <- pred$pred - 1.96*pred$se
+
+inter <- data.frame(low, high)
+
+inter[,(ncol(inter)+1)] = (coredata(test.set) > inter$low & coredata(test.set) < inter$high)[,1]
+inter[,(ncol(inter)+1)] = coredata(test.set)
+inter[,(ncol(inter)+1)] = pred$pred
+inter[,(ncol(inter)+1)] = abs(coredata(test.set) - pred$pred)/coredata(test.set)
+
+colnames(inter)[3] = "Contains"
+colnames(inter)[4] = "Observed value"
+colnames(inter)[5] = "Forecast"
+colnames(inter)[6] = "Percentual Error"
+inter
+```
+
+
+We can see on the ACF of residuals that there is a seasonal component. We will try to fit a seasonal model.
+
+
+```{r}
+milk.sarima2 <- sarima(train.set, 2,0,0, 2,D=1, S=12)
+```
+
+```{r}
+milk.sarima2
+```
+
+```{r}
+pred <- sarima.for(train.set, 12, 2,0,0, S=12)
+```
+
+
+```{r}
+str(pred)
+```
+
+
+```{r}
+accuracy(pred$pred, test.set)
+```
+
+
+```{r}
+high <- pred$pred + 1.96*pred$se
+low <- pred$pred - 1.96*pred$se
+
+inter <- data.frame(low, high)
+
+inter[,(ncol(inter)+1)] = (coredata(test.set) > inter$low & coredata(test.set) < inter$high)[,1]
+inter[,(ncol(inter)+1)] = coredata(test.set)
+inter[,(ncol(inter)+1)] = pred$pred
+inter[,(ncol(inter)+1)] = abs(coredata(test.set) - pred$pred)/coredata(test.set)
+
+colnames(inter)[3] = "Contains"
+colnames(inter)[4] = "Observed value"
+colnames(inter)[5] = "Forecast"
+colnames(inter)[6] = "Percentual Error"
+inter
+```
+
+
+Exponential Smoothing:
+
+```{r}
+e1 <- tsCV(milk.ts, ses, h=12)
+e2 <- tsCV(milk.ts, holt, h=12)
+e3 <- tsCV(milk.ts, holt, damped=TRUE, h=12)
+# Compare MSE:
+mean(e1^2, na.rm=TRUE)
+mean(e2^2, na.rm=TRUE)
+mean(e3^2, na.rm=TRUE)
+# Compare MAE:
+mean(abs(e1), na.rm=TRUE)
+mean(abs(e2), na.rm=TRUE)
+mean(abs(e3), na.rm=TRUE)
+```
+
+```{r}
+fc <- ses(milk.ts, h=12)
+# Estimated parameters:
+fc[["model"]]
+
+fc2 <- holt(milk.ts, h=12)
+# Estimated parameters:
+fc2[["model"]]
+
+fc3 <- holt(milk.ts, damped=TRUE, h=12)
+# Estimated parameters:
+fc3[["model"]]
+
+autoplot(milk.ts) +
+  autolayer(fc, series="Simple exponential smoothing method", PI=FALSE) +
+  autolayer(fc2, series="Holt's method", PI=FALSE) +
+  autolayer(fc3, series="Damped Holt's method", PI=FALSE) +
+  ggtitle("Forecasts from different methods") + xlab("Year") +
+  ylab("Milk production") +
+  guides(colour=guide_legend(title="Forecast"))
+
+autoplot(fc) +
+  xlab("Year") + ylab("Milk Production")
+```
+
+# Alfa de ~0.4,     l = 2.0852 . Fazer a comparacao dos varios. Por e comentar o output de fc[["model"]].
+# Comentar q o intervalo de confianca é bastante largo. (no autoplot)
+
+Neither of these methods make sense for this dataset since it has seasonality.
+
+```{r}
+fit1 <- hw(milk.ts,seasonal="additive")
+fit2 <- hw(milk.ts,seasonal="multiplicative")
+autoplot(milk.ts) +
+  autolayer(fit1, series="HW additive forecasts", PI=FALSE) +
+  autolayer(fit2, series="HW multiplicative forecasts",
+    PI=FALSE) +
+  xlab("Year") +
+  ylab("Milk production") +
+  ggtitle("Milk Production") +
+  guides(colour=guide_legend(title="Forecast"))
+```
+
+
+
+```{r}
+fit1
+```
+
+
+
+```{r}
+summary(fit1)
+```
+
+```{r}
+checkresiduals(fit1)
+```
+
+If we check our residuals, we see that residuals grow larger over time. This may suggest that a multiplicative error rate may be more appropriate.
+
+```{r}
+fit2
+```
+
+```{r}
+summary(fit2)
+```
+
+Multiplicative has a better performance (RMSE, MAE, MAPE, AIC and BIC are all smaller). This was expected as the time series presented increasing variance as the level increased, making multiplicative methods a better choice.
+
+```{r}
+checkresiduals(fit2)
+```
+
+
+```{r}
+fit3 <- hw(subset(milk.ts,end=length(milk.ts)-12),
+         damped = TRUE, seasonal="multiplicative", h=12)
+autoplot(milk.ts) +
+  autolayer(fit3, series="HW multi damped", PI=FALSE)+
+  guides(colour=guide_legend(title="Daily forecasts"))
+```
+
+
+```{r}
+fit3
+```
+
+```{r}
+summary(fit3)
+```
